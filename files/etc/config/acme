@@ -1,5 +1,4 @@
 config acme
-	option state_dir '/etc/ssl/acme'
 	option account_email ''
 
 config cert 'nas_cert'

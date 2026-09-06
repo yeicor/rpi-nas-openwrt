@@ -6,7 +6,38 @@
 # Check if ACME is enabled
 [ "$(uci -q get acme.nas_cert.enabled)" = "1" ] || exit 0
 
-# Only trigger initial issuance if lighttpd is still using self-signed cert or acme.pem doesn't exist
-if [ ! -s /etc/lighttpd/ssl/acme.pem ] || [ "$(readlink /etc/lighttpd/ssl/server.pem 2>/dev/null)" = "selfsigned.pem" ]; then
+# Validate active certificate state
+CFG_STAGING="$(uci -q get acme.nas_cert.staging || echo 0)"
+CFG_DOMAIN="$(uci -q get acme.nas_cert.domains | awk '{print $1}')"
+ACTIVE_CERT="/etc/lighttpd/ssl/acme.pem"
+NEEDS_RENEW=0
+
+if [ ! -s "$ACTIVE_CERT" ] || [ "$(readlink /etc/lighttpd/ssl/server.pem 2>/dev/null)" = "selfsigned.pem" ] || [ "$(readlink /etc/lighttpd/ssl/server.pem 2>/dev/null)" = "/etc/lighttpd/ssl/selfsigned.pem" ]; then
+    NEEDS_RENEW=1
+elif [ -f "$ACTIVE_CERT" ]; then
+    IS_STAGING=0
+    openssl x509 -in "$ACTIVE_CERT" -issuer -noout 2>/dev/null | grep -qi "staging" && IS_STAGING=1
+    if [ "$CFG_STAGING" = "0" ] && [ "$IS_STAGING" = "1" ]; then
+        logger -t acme-hotplug "Active certificate is Let's Encrypt Staging, but production is configured. Triggering ACME renewal."
+        NEEDS_RENEW=1
+    elif [ "$CFG_STAGING" = "1" ] && [ "$IS_STAGING" = "0" ]; then
+        logger -t acme-hotplug "Active certificate is Production, but staging is configured. Moving production cert aside and triggering ACME renewal."
+        [ -n "$CFG_DOMAIN" ] && [ -d "/etc/ssl/acme/${CFG_DOMAIN}_ecc" ] && mv "/etc/ssl/acme/${CFG_DOMAIN}_ecc" "/etc/ssl/acme/${CFG_DOMAIN}_ecc.prod-$(date +%s)"
+        NEEDS_RENEW=1
+    fi
+    if [ -n "$CFG_DOMAIN" ]; then
+        CERT_CN="$(openssl x509 -in "$ACTIVE_CERT" -subject -noout 2>/dev/null | sed -n 's/.*CN[ =]*//p')"
+        if [ "$CERT_CN" != "$CFG_DOMAIN" ]; then
+            logger -t acme-hotplug "Active certificate domain ($CERT_CN) does not match configured domain ($CFG_DOMAIN). Triggering ACME renewal."
+            NEEDS_RENEW=1
+        fi
+    fi
+    if ! openssl x509 -checkend 2592000 -noout -in "$ACTIVE_CERT" >/dev/null 2>&1; then
+        logger -t acme-hotplug "Active certificate expires in less than 30 days. Triggering ACME renewal."
+        NEEDS_RENEW=1
+    fi
+fi
+
+if [ "$NEEDS_RENEW" = "1" ]; then
     ( sleep 5 && /etc/init.d/acme renew >/dev/null 2>&1 ) &
 fi

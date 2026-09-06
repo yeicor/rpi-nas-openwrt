@@ -5,6 +5,38 @@
 set -e
 logger -t nas-setup "Starting OpenWrt Headless NAS first-boot configuration..."
 
+# ------------------------------------------------------------------------------
+# 0. Synchronize Declarative Configurations from /rom
+# ------------------------------------------------------------------------------
+# OpenWrt sysupgrade preserves /etc/config/ by default. To ensure that .env
+# changes (ACME staging mode, domains, credentials, DDNS, hostname, WiFi fallback)
+# take effect upon upgrade rather than being shadowed by stale backups,
+# sync the declarative configs from /rom into active /etc/config/.
+
+if [ -f /rom/etc/config/acme ]; then
+    logger -t nas-setup "Syncing declarative ACME configuration from /rom"
+    cp -f /rom/etc/config/acme /etc/config/acme
+fi
+
+if [ -f /rom/etc/config/ddns ]; then
+    logger -t nas-setup "Syncing declarative DDNS configuration from /rom"
+    cp -f /rom/etc/config/ddns /etc/config/ddns
+fi
+
+if [ -f /rom/etc/config/system ]; then
+    ROM_HOST="$(uci -c /rom/etc/config get system.@system[0].hostname 2>/dev/null || true)"
+    if [ -n "$ROM_HOST" ]; then
+        uci set "system.@system[0].hostname=$ROM_HOST"
+        uci commit system
+    fi
+fi
+
+if [ -f /rom/etc/nas_wifi.conf ]; then
+    logger -t nas-setup "Syncing declarative WiFi configuration from /rom"
+    cp -f /rom/etc/nas_wifi.conf /etc/nas_wifi.conf
+    chmod 600 /etc/nas_wifi.conf
+fi
+
 # Read configuration variables
 NAS_USER="$(cat /etc/nas_user 2>/dev/null || echo "nasuser")"
 NAS_PASS_HASH="$(cat /etc/nas_pass_hash 2>/dev/null || echo "")"
@@ -218,6 +250,42 @@ if [ -x /etc/init.d/acme ]; then
         /etc/init.d/acme enable 2>/dev/null || true
         /etc/init.d/acme start 2>/dev/null || true
         [ -x /etc/acme-hook-lighttpd.sh ] && /etc/acme-hook-lighttpd.sh >/dev/null 2>&1 || true
+
+        # Validate whether active certificate matches configured staging mode and domain
+        CFG_STAGING="$(uci -q get acme.nas_cert.staging || echo 0)"
+        CFG_DOMAIN="$(uci -q get acme.nas_cert.domains | awk '{print $1}')"
+        ACTIVE_CERT="/etc/lighttpd/ssl/acme.pem"
+        NEEDS_RENEW=0
+
+        if [ ! -s "$ACTIVE_CERT" ] || [ "$(readlink /etc/lighttpd/ssl/server.pem 2>/dev/null)" = "selfsigned.pem" ] || [ "$(readlink /etc/lighttpd/ssl/server.pem 2>/dev/null)" = "/etc/lighttpd/ssl/selfsigned.pem" ]; then
+            NEEDS_RENEW=1
+        elif [ -f "$ACTIVE_CERT" ]; then
+            IS_STAGING=0
+            openssl x509 -in "$ACTIVE_CERT" -issuer -noout 2>/dev/null | grep -qi "staging" && IS_STAGING=1
+            if [ "$CFG_STAGING" = "0" ] && [ "$IS_STAGING" = "1" ]; then
+                logger -t nas-setup "Active certificate is Let's Encrypt Staging, but production is configured. Scheduling ACME renewal."
+                NEEDS_RENEW=1
+            elif [ "$CFG_STAGING" = "1" ] && [ "$IS_STAGING" = "0" ]; then
+                logger -t nas-setup "Active certificate is Production, but staging is configured. Scheduling ACME renewal."
+                [ -n "$CFG_DOMAIN" ] && [ -d "/etc/ssl/acme/${CFG_DOMAIN}_ecc" ] && mv "/etc/ssl/acme/${CFG_DOMAIN}_ecc" "/etc/ssl/acme/${CFG_DOMAIN}_ecc.prod-$(date +%s)"
+                NEEDS_RENEW=1
+            fi
+            if [ -n "$CFG_DOMAIN" ]; then
+                CERT_CN="$(openssl x509 -in "$ACTIVE_CERT" -subject -noout 2>/dev/null | sed -n 's/.*CN[ =]*//p')"
+                if [ "$CERT_CN" != "$CFG_DOMAIN" ]; then
+                    logger -t nas-setup "Active certificate domain ($CERT_CN) does not match configured domain ($CFG_DOMAIN). Scheduling ACME renewal."
+                    NEEDS_RENEW=1
+                fi
+            fi
+            if ! openssl x509 -checkend 2592000 -noout -in "$ACTIVE_CERT" >/dev/null 2>&1; then
+                logger -t nas-setup "Active certificate expires in less than 30 days. Scheduling ACME renewal."
+                NEEDS_RENEW=1
+            fi
+        fi
+
+        if [ "$NEEDS_RENEW" = "1" ]; then
+            ( sleep 10 && /etc/init.d/acme renew >/dev/null 2>&1 ) &
+        fi
     fi
 fi
 

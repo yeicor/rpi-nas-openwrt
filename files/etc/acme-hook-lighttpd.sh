@@ -27,7 +27,8 @@ elif [ -f "/etc/ssl/acme/$DOMAIN/key.pem" ] && [ -f "/etc/ssl/acme/$DOMAIN/fullc
 fi
 
 if [ -n "$COMBINED" ] && [ -f "$COMBINED" ]; then
-    logger -t acme-hook "Updating Lighttpd SSL certificate for $DOMAIN"
+    CERT_ISSUER="$(openssl x509 -in "$COMBINED" -issuer -noout 2>/dev/null || echo 'Unknown')"
+    logger -t acme-hook "Updating Lighttpd SSL certificate for $DOMAIN ($CERT_ISSUER)"
     if [ "$COMBINED" != "$SSL_DIR/acme.pem" ]; then
         cp -f "$COMBINED" "$SSL_DIR/acme.pem"
     fi
