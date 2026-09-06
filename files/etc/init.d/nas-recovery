@@ -1,0 +1,26 @@
+#!/bin/sh /etc/rc.common
+# ==============================================================================
+# OpenWrt Headless NAS – Recovery & Health Watchdog Service
+# Runs on boot to monitor core service stability after remote upgrades.
+# If an upgrade trial is active and core services (SSH, Tailscale) fail to
+# stabilize, it automatically initiates rollback to the stock firmware.
+# ==============================================================================
+
+START=99
+STOP=10
+
+PROG=/usr/bin/nas-recovery
+
+boot() {
+    start "$@"
+}
+
+start() {
+    # Ensure recovery partition is mounted
+    $PROG init-storage >/dev/null 2>&1 || true
+
+    # Run check-and-watch in background as a one-shot watchdog task.
+    # It checks if an upgrade trial is active; if not, it exits immediately.
+    $PROG check-and-watch >/dev/null 2>&1 &
+}
+

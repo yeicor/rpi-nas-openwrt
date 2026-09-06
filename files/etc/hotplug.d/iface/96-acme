@@ -1,0 +1,12 @@
+#!/bin/sh
+# Trigger initial ACME certificate issuance upon interface connection if not already deployed
+
+[ "$ACTION" = "ifup" ] || exit 0
+
+# Check if ACME is enabled
+[ "$(uci -q get acme.nas_cert.enabled)" = "1" ] || exit 0
+
+# Only trigger initial issuance if lighttpd is still using self-signed cert or acme.pem doesn't exist
+if [ ! -s /etc/lighttpd/ssl/acme.pem ] || [ "$(readlink /etc/lighttpd/ssl/server.pem 2>/dev/null)" = "selfsigned.pem" ]; then
+    ( sleep 5 && /etc/init.d/acme renew >/dev/null 2>&1 ) &
+fi

@@ -1,0 +1,279 @@
+#!/bin/sh
+# ==============================================================================
+# OpenWrt Headless NAS – WiFi Auto-Connection & Failover Manager
+# Automatically connects to saved WiFi networks (up to 2 SSIDs) if Ethernet
+# is disconnected/unavailable, and gracefully places WiFi in standby when
+# Ethernet is connected.
+# ==============================================================================
+
+set -e
+
+CONF_FILE="/etc/nas_wifi.conf"
+
+log() {
+    local msg="[nas-wifi] $(date -u +"%Y-%m-%d %H:%M:%S UTC") $*"
+    echo "$msg"
+    logger -t nas-wifi "$*" 2>/dev/null || true
+}
+
+get_wifi_ifname() {
+    local iface
+    iface="$(iw dev 2>/dev/null | awk '/Interface/ {print $2}' | head -n 1)"
+    [ -z "$iface" ] && iface="wlan0"
+    echo "$iface"
+}
+
+is_ethernet_available() {
+    # Check if eth0 interface exists, has link carrier, and has an assigned IPv4
+    if [ -f /sys/class/net/eth0/carrier ] && [ "$(cat /sys/class/net/eth0/carrier 2>/dev/null)" = "1" ]; then
+        if ip -4 addr show dev eth0 2>/dev/null | grep -q "inet "; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+is_wifi_associated() {
+    local ifname
+    ifname="$(get_wifi_ifname)"
+    if iw dev "$ifname" link 2>/dev/null | grep -q "Connected to"; then
+        return 0
+    fi
+    return 1
+}
+
+is_wifi_healthy() {
+    # Returns 0 if WiFi is associated AND has an IPv4 address
+    local ifname
+    ifname="$(get_wifi_ifname)"
+    if iw dev "$ifname" link 2>/dev/null | grep -q "Connected to"; then
+        if ip -4 addr show dev "$ifname" 2>/dev/null | grep -q "inet " || \
+           ip -4 addr show dev "phy0-sta0" 2>/dev/null | grep -q "inet " || \
+           ubus call network.interface.wifi status 2>/dev/null | grep -q '"up": true'; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+get_ethernet_ip() {
+    ip -4 addr show dev eth0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n 1
+}
+
+get_wifi_ip() {
+    local ifname
+    ifname="$(get_wifi_ifname)"
+    local ip_val
+    ip_val="$(ip -4 addr show dev "$ifname" 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n 1)"
+    if [ -z "$ip_val" ]; then
+        ip_val="$(ip -4 addr show dev phy0-sta0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n 1)"
+    fi
+    echo "$ip_val"
+}
+
+get_wifi_current_ssid() {
+    local ifname
+    ifname="$(get_wifi_ifname)"
+    iw dev "$ifname" link 2>/dev/null | awk '/SSID:/ {print $2}' | head -n 1
+}
+
+connect_ssid() {
+    local ssid="$1"
+    local key="$2"
+    local band="${3:-2g}"
+
+    log "No Ethernet available. Connecting WiFi to SSID '$ssid' (band: $band)..."
+
+    uci set wireless.radio0.band="$band"
+    uci set wireless.radio0.disabled='0'
+    uci set wireless.sta.ssid="$ssid"
+    if [ -n "$key" ]; then
+        uci set wireless.sta.encryption="sae-mixed"
+        uci set wireless.sta.key="$key"
+    else
+        uci set wireless.sta.encryption="none"
+        uci -q delete wireless.sta.key
+    fi
+    uci set wireless.sta.disabled='0'
+    uci commit wireless
+    wifi reload
+
+    # Trigger DHCP renewal on wifi interface
+    ubus call network.interface.wifi up 2>/dev/null || true
+}
+
+disconnect_wifi() {
+    if [ "$(uci -q get wireless.sta.disabled)" != "1" ]; then
+        log "Ethernet is active. Placing WiFi into standby..."
+        uci set wireless.sta.disabled='1'
+        uci commit wireless
+        wifi reload
+    fi
+}
+
+scan_and_connect() {
+    local ifname
+    ifname="$(get_wifi_ifname)"
+    ip link set "$ifname" up 2>/dev/null || true
+
+    log "Scanning for saved WiFi networks..."
+    local scan_out
+    scan_out="$(iw dev "$ifname" scan 2>/dev/null || true)"
+
+    local target_ssid=""
+    local target_key=""
+    local target_band="2g"
+
+    # Priority 1: WIFI_SSID_1
+    if [ -n "$WIFI_SSID_1" ] && echo "$scan_out" | grep -F -q "SSID: $WIFI_SSID_1"; then
+        target_ssid="$WIFI_SSID_1"
+        target_key="$WIFI_KEY_1"
+        local freq
+        freq="$(echo "$scan_out" | grep -B 2 -F "SSID: $WIFI_SSID_1" | awk '/freq:/ {print $2}' | head -n 1 | cut -d. -f1)"
+        [ -n "$freq" ] && [ "$freq" -ge 5000 ] && target_band="5g"
+        log "Discovered Priority 1 SSID: '$target_ssid' (freq: ${freq:-2412}MHz -> band: $target_band)"
+    # Priority 2: WIFI_SSID_2
+    elif [ -n "$WIFI_SSID_2" ] && echo "$scan_out" | grep -F -q "SSID: $WIFI_SSID_2"; then
+        target_ssid="$WIFI_SSID_2"
+        target_key="$WIFI_KEY_2"
+        local freq
+        freq="$(echo "$scan_out" | grep -B 2 -F "SSID: $WIFI_SSID_2" | awk '/freq:/ {print $2}' | head -n 1 | cut -d. -f1)"
+        [ -n "$freq" ] && [ "$freq" -ge 5000 ] && target_band="5g"
+        log "Discovered Priority 2 SSID: '$target_ssid' (freq: ${freq:-2412}MHz -> band: $target_band)"
+    fi
+
+    # Fallback if scan did not match or hidden: try SSID 1 then SSID 2
+    if [ -z "$target_ssid" ]; then
+        if [ "$LAST_TRIED_SSID" = "$WIFI_SSID_1" ] && [ -n "$WIFI_SSID_2" ]; then
+            target_ssid="$WIFI_SSID_2"
+            target_key="$WIFI_KEY_2"
+            target_band="2g"
+            log "Neither SSID seen in scan. Alternating trial to SSID 2: '$target_ssid'"
+        elif [ -n "$WIFI_SSID_1" ]; then
+            target_ssid="$WIFI_SSID_1"
+            target_key="$WIFI_KEY_1"
+            target_band="2g"
+            log "Neither SSID seen in scan. Attempting SSID 1: '$target_ssid'"
+        elif [ -n "$WIFI_SSID_2" ]; then
+            target_ssid="$WIFI_SSID_2"
+            target_key="$WIFI_KEY_2"
+            target_band="2g"
+            log "Attempting SSID 2: '$target_ssid'"
+        fi
+    fi
+
+    if [ -n "$target_ssid" ]; then
+        LAST_TRIED_SSID="$target_ssid"
+        connect_ssid "$target_ssid" "$target_key" "$target_band"
+    fi
+}
+
+check_cycle() {
+    if is_ethernet_available; then
+        local eth_ip
+        eth_ip="$(get_ethernet_ip)"
+        if [ "$PREV_ETH_STATE" != "1" ]; then
+            log "Ethernet is online (eth0 IP: ${eth_ip:-unknown})."
+            PREV_ETH_STATE=1
+        fi
+        disconnect_wifi
+        return 0
+    fi
+
+    # Ethernet is DOWN / unavailable
+    if [ "$PREV_ETH_STATE" != "0" ]; then
+        log "Ethernet is disconnected or has no IP lease. Activating WiFi fallback..."
+        PREV_ETH_STATE=0
+    fi
+
+    if is_wifi_healthy; then
+        local w_ssid
+        w_ssid="$(get_wifi_current_ssid)"
+        local w_ip
+        w_ip="$(get_wifi_ip)"
+        if [ "$PREV_WIFI_STATE" != "connected" ]; then
+            log "WiFi fallback connected successfully to '${w_ssid}' (IP: ${w_ip:-dhcp-pending})."
+            PREV_WIFI_STATE="connected"
+        fi
+        return 0
+    fi
+
+    # WiFi is NOT healthy/connected
+    PREV_WIFI_STATE="disconnected"
+    scan_and_connect
+}
+
+status() {
+    echo "==========================================================="
+    echo " OpenWrt Headless NAS – Network Status"
+    echo "==========================================================="
+    if [ -f "$CONF_FILE" ]; then
+        # shellcheck disable=SC1090
+        . "$CONF_FILE"
+        echo "Configured WiFi Fallbacks:"
+        [ -n "$WIFI_SSID_1" ] && echo "  - Priority 1: '$WIFI_SSID_1'"
+        [ -n "$WIFI_SSID_2" ] && echo "  - Priority 2: '$WIFI_SSID_2'"
+    else
+        echo "Configured WiFi Fallbacks: None (/etc/nas_wifi.conf not found)"
+    fi
+    echo ""
+
+    local eth_avail="DOWN (Disconnected/No IP)"
+    if is_ethernet_available; then
+        eth_avail="ACTIVE (IP: $(get_ethernet_ip))"
+    fi
+    echo "Ethernet (eth0):  $eth_avail"
+
+    local wifi_avail="STANDBY (Disabled)"
+    if is_wifi_healthy; then
+        wifi_avail="CONNECTED (SSID: $(get_wifi_current_ssid), IP: $(get_wifi_ip))"
+    elif is_wifi_associated; then
+        wifi_avail="ASSOCIATED (SSID: $(get_wifi_current_ssid), Awaiting IP)"
+    elif [ "$(uci -q get wireless.sta.disabled)" = "0" ]; then
+        wifi_avail="SCANNING / CONNECTING..."
+    fi
+    echo "WiFi Interface:   $wifi_avail"
+    echo "==========================================================="
+}
+
+# --- Main Entrypoint ---
+case "${1:-}" in
+    status)
+        status
+        exit 0
+        ;;
+    check)
+        if [ ! -f "$CONF_FILE" ]; then
+            exit 0
+        fi
+        # shellcheck disable=SC1090
+        . "$CONF_FILE"
+        [ -z "$WIFI_SSID_1" ] && [ -z "$WIFI_SSID_2" ] && exit 0
+        check_cycle
+        exit 0
+        ;;
+    monitor|*)
+        if [ ! -f "$CONF_FILE" ]; then
+            log "No WiFi configuration found at $CONF_FILE. Exiting."
+            exit 0
+        fi
+        # shellcheck disable=SC1090
+        . "$CONF_FILE"
+        if [ -z "$WIFI_SSID_1" ] && [ -z "$WIFI_SSID_2" ]; then
+            log "No WiFi SSIDs configured in $CONF_FILE. Exiting."
+            exit 0
+        fi
+
+        log "Starting WiFi auto-connection & failover monitor..."
+        log "Priority 1 SSID: '${WIFI_SSID_1:-none}', Priority 2 SSID: '${WIFI_SSID_2:-none}'"
+
+        PREV_ETH_STATE=-1
+        PREV_WIFI_STATE="unknown"
+        LAST_TRIED_SSID=""
+
+        while true; do
+            check_cycle || true
+            sleep 8
+        done
+        ;;
+esac

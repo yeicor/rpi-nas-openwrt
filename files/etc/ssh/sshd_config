@@ -1,0 +1,22 @@
+# OpenSSH daemon configuration for OpenWrt Headless NAS
+Port 22
+ListenAddress 0.0.0.0
+ListenAddress ::
+
+HostKey /etc/ssh/ssh_host_rsa_key
+HostKey /etc/ssh/ssh_host_ecdsa_key
+HostKey /etc/ssh/ssh_host_ed25519_key
+
+# Authentication
+PermitRootLogin yes
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys /etc/dropbear/authorized_keys
+PasswordAuthentication yes
+PermitEmptyPasswords no
+StrictModes no
+
+# SFTP Subsystem
+Subsystem sftp /usr/lib/sftp-server
+
+# Include modular drop-in configurations
+Include /etc/ssh/sshd_config.d/*.conf

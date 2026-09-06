@@ -1,0 +1,24 @@
+# Loopback interface
+config interface 'loopback'
+	option device 'lo'
+	option proto 'static'
+	option ipaddr '127.0.0.1'
+	option netmask '255.0.0.0'
+
+# LAN interface on physical eth0 - pure DHCP client (Primary, metric 10)
+config device
+	option name 'eth0'
+	option type '8023-ether'
+
+config interface 'lan'
+	option device 'eth0'
+	option proto 'dhcp'
+	option hostname 'rpi4-nas'
+	option metric '10'
+
+# WiFi fallback interface on wireless client (Secondary, metric 20)
+config interface 'wifi'
+	option proto 'dhcp'
+	option hostname 'rpi4-nas'
+	option metric '20'
+

@@ -1,0 +1,27 @@
+# Local environment & secrets
+.env
+*.pem
+*.key
+*.crt
+*authorized_keys*
+*ssh_host_*
+*.flag
+*.token
+
+# Build outputs & caches
+output/
+/bin/
+build/
+cache/
+*.img
+*.img.gz
+*.tar.gz
+*.tar.zst
+
+# Test & diagnostic artifacts
+tests/tmp/
+tests/test-usb.img
+
+# Temporary / editor files
+*~
+.DS_Store

@@ -1,0 +1,14 @@
+services:
+  builder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./output:/output
+      - ./build/cache:/builder/cache
+      - ./build/overlay:/builder/overlay
+    environment:
+      - OPENWRT_VERSION=${OPENWRT_VERSION:-25.12.5}
+      - OPENWRT_TARGET=${OPENWRT_TARGET:-bcm27xx/bcm2711}
+      - OPENWRT_PROFILE=${OPENWRT_PROFILE:-rpi-4}
+      - CUSTOM_PACKAGES=${CUSTOM_PACKAGES:-}

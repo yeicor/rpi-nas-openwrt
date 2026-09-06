@@ -1,0 +1,536 @@
+#!/bin/sh
+# ==============================================================================
+# OpenWrt Headless NAS – Recovery & Automated Rollback Manager
+# Manages the dedicated stock recovery partition (/recovery on /dev/mmcblk0p3),
+# tracks upgrade trial states, verifies core services (SSH, Tailscale, WebDAV),
+# and automatically rolls back to stock firmware on failure.
+# ==============================================================================
+
+set -e
+
+RECOVERY_DIR="/recovery"
+BOOT_DEV="/dev/mmcblk0"
+RECOVERY_DEV="/dev/mmcblk0p3"
+TRIAL_FILE="${RECOVERY_DIR}/upgrade_trial.json"
+BOOT_TRIAL_FLAG="/boot/upgrade_trial.flag"
+STOCK_IMG="${RECOVERY_DIR}/stock-firmware.img.gz"
+STOCK_SHA="${RECOVERY_DIR}/stock-firmware.sha256"
+STOCK_META="${RECOVERY_DIR}/stock-firmware.meta"
+
+log() {
+    local msg="[nas-recovery] $(date -u +"%Y-%m-%d %H:%M:%S UTC") $*"
+    echo "$msg"
+    if grep -q " ${RECOVERY_DIR} " /proc/mounts 2>/dev/null; then
+        echo "$msg" >> "${RECOVERY_DIR}/recovery.log" 2>/dev/null || true
+        sync
+    fi
+    logger -t nas-recovery "$*" 2>/dev/null || true
+}
+
+ensure_mounted() {
+    mkdir -p "$RECOVERY_DIR"
+    if ! grep -q " ${RECOVERY_DIR} " /proc/mounts; then
+        if [ -b "$RECOVERY_DEV" ]; then
+            mount -o rw,noatime "$RECOVERY_DEV" "$RECOVERY_DIR" 2>/dev/null || true
+        fi
+    fi
+}
+
+init_storage() {
+    log "Checking recovery partition on ${BOOT_DEV}..."
+    if [ ! -b "$BOOT_DEV" ]; then
+        log "Boot device ${BOOT_DEV} not found (running in container or non-MMC platform)."
+        mkdir -p "$RECOVERY_DIR"
+        return 0
+    fi
+
+    if [ ! -b "$RECOVERY_DEV" ]; then
+        log "Recovery partition ${RECOVERY_DEV} does not exist. Creating 512MB partition 3..."
+        
+        # Determine start sector after partition 2
+        P2_END="$(fdisk -l "$BOOT_DEV" 2>/dev/null | grep "^${BOOT_DEV}p2\b" | awk '{print $3}')"
+        if [ -z "$P2_END" ]; then
+            P2_END="$(fdisk -l "$BOOT_DEV" 2>/dev/null | grep "^${BOOT_DEV}2\b" | awk '{print $3}')"
+        fi
+
+        if [ -n "$P2_END" ]; then
+            START_SECTOR=$((P2_END + 1))
+            # Align to 4096 (2048 sector boundary)
+            ALIGN_SECTOR=$(( ((START_SECTOR + 2047) / 2048) * 2048 ))
+            log "Creating partition 3 starting at sector ${ALIGN_SECTOR} (+512M)..."
+            printf "n\np\n3\n%s\n+512M\nw\n" "$ALIGN_SECTOR" | fdisk "$BOOT_DEV" >/dev/null 2>&1 || true
+            
+            # Inform kernel of partition change
+            partx -a "$BOOT_DEV" 2>/dev/null || block info >/dev/null 2>&1 || true
+            sleep 1
+        fi
+    fi
+
+    if [ -b "$RECOVERY_DEV" ]; then
+        # Format if not yet formatted
+        FSTYPE="$(/sbin/block info "$RECOVERY_DEV" 2>/dev/null | grep -o 'TYPE="[^"]*"' | cut -d'"' -f2 || true)"
+        if [ -z "$FSTYPE" ] && command -v mkfs.ext4 >/dev/null 2>&1; then
+            log "Formatting ${RECOVERY_DEV} as ext4 (label RECOVERY)..."
+            mkfs.ext4 -F -L RECOVERY "$RECOVERY_DEV" >/dev/null 2>&1 || true
+        fi
+
+        mkdir -p "$RECOVERY_DIR"
+        if ! grep -q " ${RECOVERY_DIR} " /proc/mounts; then
+            mount -o rw,noatime "$RECOVERY_DEV" "$RECOVERY_DIR" 2>/dev/null || true
+        fi
+        log "Recovery storage initialized and mounted at ${RECOVERY_DIR}."
+    else
+        log "Warning: ${RECOVERY_DEV} could not be created or accessed."
+    fi
+}
+
+save_stock() {
+    local src_img="$1"
+    ensure_mounted
+
+    if [ -z "$src_img" ] || [ ! -f "$src_img" ]; then
+        log "Error: source image '$src_img' does not exist." >&2
+        return 1
+    fi
+
+    log "Saving stock firmware image from $src_img to $STOCK_IMG..."
+    cp -f "$src_img" "$STOCK_IMG"
+    sha256sum "$STOCK_IMG" | awk '{print $1}' > "$STOCK_SHA"
+
+    # Save stock metadata
+    {
+        echo "SAVED_AT=$(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+        echo "VERSION=$(cat /etc/openwrt_version 2>/dev/null || cat /etc/openwrt_release 2>/dev/null || echo 'unknown')"
+        echo "BUILD_ID=$(cat /etc/nas_build_id 2>/dev/null || echo 'initial')"
+        echo "SHA256=$(cat "$STOCK_SHA")"
+    } > "$STOCK_META"
+
+    # Also save pristine initial config
+    if command -v sysupgrade >/dev/null 2>&1; then
+        log "Saving initial stock configuration backup..."
+        sysupgrade -b "${RECOVERY_DIR}/stock-config.tar.gz" >/dev/null 2>&1 || true
+    fi
+
+    log "Stock firmware and configuration successfully stored in recovery partition."
+}
+
+verify_health() {
+    # 1. SSH Server Check: verify process is running, port 22 is open, and OpenSSH banner responds
+    local ssh_ok=0
+    if pgrep -f "/usr/sbin/sshd" >/dev/null 2>&1; then
+        if netstat -tuln 2>/dev/null | grep -q ":22\b"; then
+            if echo "" | nc 127.0.0.1 22 2>/dev/null | grep -q "SSH-"; then
+                ssh_ok=1
+            fi
+        fi
+    fi
+
+    # 2. Tailscale Check
+    local ts_ok=0
+    if pgrep -f "tailscaled" >/dev/null 2>&1; then
+        # Check if tailscale CLI reports valid state
+        if tailscale status >/dev/null 2>&1; then
+            local ts_backend
+            ts_backend="$(tailscale status --json 2>/dev/null | grep -o '"BackendState":"[^"]*"' | cut -d'"' -f4 || true)"
+            if [ "$ts_backend" = "Running" ] || [ "$ts_backend" = "Starting" ]; then
+                ts_ok=1
+            elif tailscale status 2>/dev/null | grep -q -E "([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|offers exit node|idle|active)"; then
+                ts_ok=1
+            fi
+        fi
+    fi
+
+    # 3. Lighttpd WebDAV Check
+    local http_ok=0
+    if pgrep -f "/usr/sbin/lighttpd" >/dev/null 2>&1; then
+        http_ok=1
+    fi
+
+    if [ "$ssh_ok" -eq 1 ] && [ "$ts_ok" -eq 1 ] && [ "$http_ok" -eq 1 ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+arm_trial() {
+    local target_id="${1:-unknown}"
+    ensure_mounted
+
+    log "Arming upgrade trial watchdog for build '$target_id'..."
+    if [ -f "${RECOVERY_DIR}/recovery.log" ]; then
+        sed -i 's/AUTOMATIC ROLLBACK TO STOCK FIRMWARE/PREVIOUS ROLLBACK/g' "${RECOVERY_DIR}/recovery.log" 2>/dev/null || true
+    fi
+    mkdir -p "$RECOVERY_DIR"
+    cat <<EOF > "$TRIAL_FILE"
+{
+  "status": "pending_verification",
+  "target_build": "$target_id",
+  "attempts": 0,
+  "max_attempts": 2,
+  "armed_at": "$(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+}
+EOF
+    # Sync to disk
+    sync
+    log "Upgrade trial armed. Automatic rollback will engage if core services fail on boot."
+}
+
+disarm_trial() {
+    ensure_mounted
+    if [ -f "$TRIAL_FILE" ]; then
+        log "Disarming upgrade trial. Firmware committed."
+        rm -f "$TRIAL_FILE" "$BOOT_TRIAL_FLAG"
+        sync
+    fi
+}
+
+REPORT_DIR="${RECOVERY_DIR}/rollback_reports"
+LATEST_REPORT="${REPORT_DIR}/rollback-latest.tar.gz"
+LATEST_SUMMARY="${REPORT_DIR}/rollback-summary.txt"
+
+collect_rollback_diagnostics() {
+    local reason="${1:-Core services failed to stabilize}"
+    ensure_mounted
+    mkdir -p "$REPORT_DIR"
+
+    local timestamp
+    timestamp="$(date -u +"%Y%m%d_%H%M%S")"
+    local target_build
+    target_build="$(grep '"target_build"' "$TRIAL_FILE" 2>/dev/null | cut -d'"' -f4 || echo 'unknown')"
+    local diag_dir="/tmp/rollback_diag_${timestamp}"
+    rm -rf "$diag_dir"
+    mkdir -p "$diag_dir"
+
+    log "Collecting comprehensive rollback failure diagnostics for build '$target_build'..."
+
+    # 1. Detailed Health Diagnosis
+    {
+        echo "==========================================================="
+        echo " ROLLBACK FAILURE DIAGNOSTIC REPORT"
+        echo "==========================================================="
+        echo "Timestamp:      $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+        echo "Target Build:   $target_build"
+        echo "Current Build:  $(cat /etc/nas_build_id 2>/dev/null || echo 'unknown')"
+        echo "Build Info:     $(cat /etc/nas_build_info 2>/dev/null | tr '\n' ' ')"
+        echo "Rollback Cause: $reason"
+        echo ""
+        echo "Health Check Breakdown:"
+
+        # SSH Check
+        echo -n "  - OpenSSH Service:   "
+        if pgrep -f "/usr/sbin/sshd" >/dev/null 2>&1; then
+            if netstat -tuln 2>/dev/null | grep -q ":22\b"; then
+                if echo "" | nc 127.0.0.1 22 2>/dev/null | grep -q "SSH-"; then
+                    echo "PASS (Running, listening on 22, protocol banner OK)"
+                else
+                    echo "FAIL (Process running, port 22 open, but protocol banner failed)"
+                fi
+            else
+                echo "FAIL (Process running, but port 22 not listening)"
+            fi
+        else
+            echo "FAIL (sshd process is NOT running!)"
+        fi
+
+        # Tailscale Check
+        echo -n "  - Tailscale Service: "
+        if pgrep -f "tailscaled" >/dev/null 2>&1; then
+            local ts_status
+            ts_status="$(tailscale status 2>&1 || true)"
+            if echo "$ts_status" | grep -q -E "(Logged out|NeedsLogin)"; then
+                echo "FAIL (Logged out / Needs Login)"
+            elif tailscale status >/dev/null 2>&1; then
+                echo "PASS (Connected)"
+            else
+                echo "DEGRADED (${ts_status:-no response})"
+            fi
+        else
+            echo "FAIL (tailscaled process is NOT running!)"
+        fi
+
+        # Lighttpd WebDAV Check
+        echo -n "  - WebDAV Service:    "
+        if pgrep -f "/usr/sbin/lighttpd" >/dev/null 2>&1; then
+            echo "PASS (Running)"
+        else
+            echo "FAIL (lighttpd process is NOT running!)"
+        fi
+
+        # Network Interfaces Check
+        echo -n "  - Ethernet (eth0):   "
+        if [ -f /sys/class/net/eth0/carrier ] && [ "$(cat /sys/class/net/eth0/carrier 2>/dev/null)" = "1" ]; then
+            echo "LINK UP (IP: $(ip -4 addr show dev eth0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n 1))"
+        else
+            echo "LINK DOWN / DISCONNECTED"
+        fi
+
+        echo -n "  - WiFi (wlan0):      "
+        local w_if
+        w_if="$(iw dev 2>/dev/null | awk '/Interface/ {print $2}' | head -n 1)"
+        if [ -n "$w_if" ] && iw dev "$w_if" link 2>/dev/null | grep -q "Connected to"; then
+            echo "CONNECTED (SSID: $(iw dev "$w_if" link 2>/dev/null | awk '/SSID:/ {print $2}' | head -n 1), IP: $(ip -4 addr show dev "$w_if" 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n 1))"
+        else
+            echo "DISCONNECTED / STANDBY"
+        fi
+        echo "==========================================================="
+    } > "$diag_dir/diagnosis.txt"
+
+    # Save concise summary to recovery directory
+    cp -f "$diag_dir/diagnosis.txt" "$LATEST_SUMMARY"
+
+    # 2. Kernel & System Logs
+    dmesg > "$diag_dir/dmesg.log" 2>&1 || true
+    logread > "$diag_dir/logread.log" 2>&1 || true
+
+    # 3. Process Table & Sockets
+    ps w > "$diag_dir/ps.log" 2>&1 || true
+    netstat -tulnp > "$diag_dir/netstat.log" 2>&1 || true
+
+    # 4. Network Status
+    ip addr > "$diag_dir/ip_addr.log" 2>&1 || true
+    ip route > "$diag_dir/ip_route.log" 2>&1 || true
+    if command -v iw >/dev/null 2>&1; then
+        iw dev > "$diag_dir/iw_dev.log" 2>&1 || true
+    fi
+
+    # 5. Service & Procd Status
+    if command -v ubus >/dev/null 2>&1; then
+        ubus call service list > "$diag_dir/ubus_services.json" 2>&1 || true
+        ubus call system info > "$diag_dir/ubus_system_info.json" 2>&1 || true
+    fi
+
+    # 6. Lighttpd Syntax & Test
+    if command -v lighttpd >/dev/null 2>&1; then
+        lighttpd -tt -f /etc/lighttpd/lighttpd.conf > "$diag_dir/lighttpd_test.log" 2>&1 || true
+    fi
+
+    # 7. Tailscale Status
+    if command -v tailscale >/dev/null 2>&1; then
+        tailscale status --json > "$diag_dir/tailscale_status.json" 2>&1 || true
+        tailscale netcheck > "$diag_dir/tailscale_netcheck.log" 2>&1 || true
+    fi
+
+    # 8. Failed Configurations (/etc/config/ and /etc/ssh/)
+    mkdir -p "$diag_dir/etc_config"
+    cp -r /etc/config/* "$diag_dir/etc_config/" 2>/dev/null || true
+    mkdir -p "$diag_dir/etc_ssh"
+    cp /etc/ssh/sshd_config "$diag_dir/etc_ssh/" 2>/dev/null || true
+
+    # 9. Pack into tar.gz on persistent /recovery partition
+    local report_archive="${REPORT_DIR}/rollback-${timestamp}-${target_build}.tar.gz"
+    (
+        cd "$diag_dir" && tar -czf "$report_archive" .
+    ) 2>/dev/null || true
+    cp -f "$report_archive" "$LATEST_REPORT"
+    sync
+
+    # Append summary snippet to recovery.log
+    cat "$diag_dir/diagnosis.txt" >> "${RECOVERY_DIR}/recovery.log" 2>/dev/null || true
+    sync
+
+    rm -rf "$diag_dir"
+    log "Rollback diagnostics saved to $report_archive and $LATEST_REPORT."
+}
+
+revert_stock() {
+    local reason="${1:-Core services failed to reach healthy state}"
+    ensure_mounted
+    log "==========================================================="
+    log " AUTOMATIC ROLLBACK TO STOCK FIRMWARE"
+    log " Reason: $reason"
+    log "==========================================================="
+
+    # Collect comprehensive failure diagnostics before flashing
+    collect_rollback_diagnostics "$reason"
+
+    if [ ! -f "$STOCK_IMG" ]; then
+        log "CRITICAL ERROR: Stock firmware image '$STOCK_IMG' not found!" >&2
+        return 1
+    fi
+
+    # Validate checksum if available
+    if [ -f "$STOCK_SHA" ]; then
+        local expected
+        expected="$(cat "$STOCK_SHA")"
+        local actual
+        actual="$(sha256sum "$STOCK_IMG" | awk '{print $1}')"
+        if [ "$expected" != "$actual" ]; then
+            log "CRITICAL ERROR: Stock firmware checksum mismatch! Expected: $expected, Actual: $actual" >&2
+            return 1
+        fi
+        log "Stock firmware checksum verified: $actual"
+    fi
+
+    log "Initiating sysupgrade to stock firmware..."
+    # Disarm trial so the stock boot does not re-trigger rollback
+    rm -f "$TRIAL_FILE" "$BOOT_TRIAL_FLAG"
+    sync
+
+    log "Staging stock firmware into RAM (/tmp) for safe sysupgrade..."
+    local tmp_stock="/tmp/stock-recovery.img.gz"
+    local tmp_config="/tmp/stock-config.tar.gz"
+    cp -f "$STOCK_IMG" "$tmp_stock"
+    sync
+
+    # Restore stock configuration if available
+    if [ -f "${RECOVERY_DIR}/stock-config.tar.gz" ]; then
+        log "Restoring stock configuration archive..."
+        cp -f "${RECOVERY_DIR}/stock-config.tar.gz" "$tmp_config"
+        sync
+        /sbin/sysupgrade -f "$tmp_config" "$tmp_stock" || {
+            log "ERROR: /sbin/sysupgrade failed with exit code $?!"
+        }
+    else
+        /sbin/sysupgrade -n "$tmp_stock" || {
+            log "ERROR: /sbin/sysupgrade failed with exit code $?!"
+        }
+    fi
+}
+
+check_and_watch() {
+    ensure_mounted
+    if [ ! -f "$TRIAL_FILE" ]; then
+        # No upgrade trial pending, nothing to do
+        return 0
+    fi
+
+    log "Active upgrade trial detected in $TRIAL_FILE. Starting health watchdog..."
+
+    # Read current attempt count
+    local attempts
+    attempts="$(grep '"attempts"' "$TRIAL_FILE" 2>/dev/null | tr -dc '0-9' || echo 0)"
+    local max_attempts
+    max_attempts="$(grep '"max_attempts"' "$TRIAL_FILE" 2>/dev/null | tr -dc '0-9' || echo 2)"
+    [ -z "$attempts" ] && attempts=0
+    [ -z "$max_attempts" ] && max_attempts=2
+    attempts=$((attempts + 1))
+
+    # Update attempt count
+    sed -i "s/\"attempts\":[ ]*[0-9]*/\"attempts\": $attempts/" "$TRIAL_FILE"
+    sync
+
+    if [ "$attempts" -gt "$max_attempts" ]; then
+        log "CRITICAL: Boot attempt $attempts exceeds max attempts ($max_attempts)! Core services failed to stabilize."
+        log "INITIATING AUTOMATIC ROLLBACK TO STOCK FIRMWARE NOW!"
+        revert_stock "Exceeded maximum boot attempts ($attempts/$max_attempts)"
+        return 0
+    fi
+
+    local timeout=45
+    local elapsed=0
+    log "Upgrade verification trial (attempt $attempts/$max_attempts). Waiting up to ${timeout}s for core services (SSH, Tailscale, WebDAV)..."
+
+    while [ "$elapsed" -lt "$timeout" ]; do
+        if verify_health; then
+            log "SUCCESS: All core services (SSH, Tailscale, WebDAV) verified healthy after ${elapsed}s!"
+            log "Committing upgrade and disarming trial watchdog."
+            disarm_trial
+            return 0
+        fi
+        sleep 5
+        elapsed=$((elapsed + 5))
+    done
+
+    # Timeout expired without healthy core services!
+    log "CRITICAL: Health check TIMEOUT reached after ${timeout}s! Core services did not stabilize."
+    log "INITIATING AUTOMATIC ROLLBACK TO STOCK FIRMWARE NOW!"
+    revert_stock "Core services (SSH, Tailscale, or WebDAV) failed to stabilize within ${timeout}s timeout"
+}
+
+status() {
+    ensure_mounted
+    echo "==========================================================="
+    echo " OpenWrt NAS Recovery & Health Status"
+    echo "==========================================================="
+
+    echo "1. System Information:"
+    echo "   Build Info:   $(cat /etc/nas_build_info 2>/dev/null || echo 'Unknown')"
+    echo "   Uptime:       $(uptime 2>/dev/null || echo 'Unknown')"
+
+    echo "2. Recovery Storage:"
+    echo "   Device:       $RECOVERY_DEV"
+    echo "   Mountpoint:   $RECOVERY_DIR"
+    if grep -q " ${RECOVERY_DIR} " /proc/mounts; then
+        echo "   Status:       MOUNTED"
+        echo "   Free Space:   $(df -h "$RECOVERY_DIR" 2>/dev/null | tail -n 1 | awk '{print $4}')"
+    else
+        echo "   Status:       NOT MOUNTED"
+    fi
+
+    echo "3. Stock Firmware:"
+    if [ -f "$STOCK_IMG" ]; then
+        echo "   Status:       PRESENT ($(ls -lh "$STOCK_IMG" | awk '{print $5}'))"
+        echo "   Checksum:     $(cat "$STOCK_SHA" 2>/dev/null || echo 'No SHA256 file')"
+        if [ -f "$STOCK_META" ]; then
+            cat "$STOCK_META" | while read -r line; do
+                echo "   $line"
+            done
+        fi
+    else
+        echo "   Status:       MISSING (Run 'nas-recovery save-stock <image>' to capture)"
+    fi
+
+    echo "4. Upgrade Trial Watchdog:"
+    if [ -f "$TRIAL_FILE" ]; then
+        echo "   Status:       ARMED (Trial pending verification)"
+        cat "$TRIAL_FILE"
+    else
+        echo "   Status:       INACTIVE (Current firmware committed and verified)"
+    fi
+
+    echo "5. Core Services Health:"
+    if verify_health; then
+        echo "   Overall:      HEALTHY (SSH, Tailscale, WebDAV all operational)"
+    else
+        echo "   Overall:      DEGRADED"
+    fi
+    echo "   - OpenSSH:    $(pgrep -f "/usr/sbin/sshd" >/dev/null && echo "RUNNING" || echo "STOPPED")"
+    echo "   - Tailscale:  $(pgrep -f "tailscaled" >/dev/null && tailscale status >/dev/null 2>&1 && echo "RUNNING & CONNECTED" || echo "DEGRADED/OFFLINE")"
+    echo "   - WebDAV:     $(pgrep -f "lighttpd" >/dev/null && echo "RUNNING" || echo "STOPPED")"
+    echo "   - Ethernet:   $([ "$(cat /sys/class/net/eth0/carrier 2>/dev/null)" = "1" ] && echo "LINK UP (IP: $(ip -4 addr show dev eth0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n 1))" || echo "DISCONNECTED")"
+    if [ -f /etc/nas_wifi.conf ]; then
+        echo "   - WiFi:       $(iw dev 2>/dev/null | grep -q 'Connected' && echo "CONNECTED (SSID: $(iw dev 2>/dev/null | awk '/SSID:/ {print $2}' | head -n 1))" || echo "STANDBY / AVAILABLE")"
+    fi
+
+    if [ -f "$LATEST_REPORT" ]; then
+        echo "6. Latest Rollback Diagnostics:"
+        echo "   Archive:      $LATEST_REPORT"
+        [ -f "$LATEST_SUMMARY" ] && echo "   Summary:      $(head -n 6 "$LATEST_SUMMARY" 2>/dev/null | tr '\n' ' | ')"
+    fi
+    echo "==========================================================="
+}
+
+case "${1:-}" in
+    init-storage)
+        init_storage
+        ;;
+    save-stock)
+        save_stock "$2"
+        ;;
+    arm-trial)
+        arm_trial "$2"
+        ;;
+    disarm-trial)
+        disarm_trial
+        ;;
+    verify-health)
+        verify_health && { echo "OK"; exit 0; } || { echo "FAIL"; exit 1; }
+        ;;
+    check-and-watch)
+        check_and_watch
+        ;;
+    collect-diagnostics)
+        collect_rollback_diagnostics "${2:-Manual diagnostic collection}"
+        ;;
+    revert-stock)
+        revert_stock "$2"
+        ;;
+    status)
+        status
+        ;;
+    *)
+        echo "Usage: $0 {init-storage|save-stock <img_path>|arm-trial <id>|disarm-trial|verify-health|check-and-watch|collect-diagnostics <reason>|revert-stock [reason]|status}"
+        exit 1
+        ;;
+esac

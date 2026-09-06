@@ -1,0 +1,53 @@
+#!/bin/sh /etc/rc.common
+
+START=50
+STOP=50
+
+USE_PROCD=1
+PROG=/usr/sbin/lighttpd
+
+validate_conf() {
+	$PROG -tt -f /etc/lighttpd/lighttpd.conf >/dev/null || {
+		echo 1>&2 "lighttpd.conf validation failed"
+		return 1
+	}
+}
+
+start_service() {
+	for i in /var/log/lighttpd /var/lib/lighttpd /var/cache/lighttpd; do
+		[ -d "$i" ] || mkdir -m 0775 -p "$i"
+		chown -R www-data:www-data "$i" 2>/dev/null || true
+		chmod 775 "$i" 2>/dev/null || true
+	done
+
+	for m in /mnt/sda /mnt/sda1; do
+		if ! grep -q " $m " /proc/mounts; then
+			mkdir -p "$m" 2>/dev/null || true
+			chown root:root "$m" 2>/dev/null || true
+			chmod 0700 "$m" 2>/dev/null || true
+		fi
+	done
+
+	validate_conf || exit 1
+
+	procd_open_instance
+	procd_set_param respawn
+	procd_set_param command /bin/sh -c "umask 0002 && exec $PROG -D -f /etc/lighttpd/lighttpd.conf"
+	procd_close_instance
+}
+
+service_triggers() {
+	procd_add_raw_trigger acme.renew 5000 /etc/init.d/lighttpd restart
+}
+
+reload_service() {
+	validate_conf || exit 1
+	restart
+}
+
+relog() {
+	procd_send_signal lighttpd '*' HUP
+}
+
+EXTRA_COMMANDS="relog"
+EXTRA_HELP="	relog   Reopen log files (without reloading)"

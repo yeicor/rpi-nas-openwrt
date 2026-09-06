@@ -1,0 +1,11 @@
+config acme
+	option state_dir '/etc/ssl/acme'
+	option account_email ''
+
+config cert 'nas_cert'
+	option enabled '0'
+	option validation_method 'dns'
+	option dns 'dns_cf'
+	option staging '0'
+	option calias ''
+	list update_scripts '/etc/acme-hook-lighttpd.sh'

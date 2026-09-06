@@ -1,0 +1,48 @@
+config defaults
+	option syn_flood '1'
+	option input 'ACCEPT'
+	option output 'ACCEPT'
+	option forward 'REJECT'
+
+config zone
+	option name 'lan'
+	list network 'lan'
+	list network 'wifi'
+	option input 'ACCEPT'
+	option output 'ACCEPT'
+	option forward 'ACCEPT'
+
+# Tailscale VPN Zone
+config zone
+	option name 'tailscale'
+	list device 'tailscale0'
+	option input 'ACCEPT'
+	option forward 'ACCEPT'
+	option output 'ACCEPT'
+	option masq '1'
+	option mtu_fix '1'
+
+# Allow SSH
+config rule
+	option name 'Allow-SSH'
+	option src '*'
+	option proto 'tcp'
+	option dest_port '22'
+	option target 'ACCEPT'
+
+# Allow HTTP & HTTPS (LuCI, ACME)
+config rule
+	option name 'Allow-HTTP-HTTPS'
+	option src '*'
+	option proto 'tcp'
+	option dest_port '80 443'
+	option target 'ACCEPT'
+
+# Allow WebDAV (Lighttpd non-default ports 8080 & 8443)
+config rule
+	option name 'Allow-WebDAV'
+	option src '*'
+	option proto 'tcp'
+	option dest_port '8080 8443'
+	option target 'ACCEPT'
+

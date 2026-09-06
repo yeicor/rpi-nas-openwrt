@@ -1,0 +1,9 @@
+#!/bin/sh
+# ACME Hotplug hook for Lighttpd
+# Called by /usr/lib/acme/notify upon certificate issuance or renewal
+
+[ "$ACTION" = "issued" ] || [ "$ACTION" = "renewed" ] || exit 0
+
+if [ -x /etc/acme-hook-lighttpd.sh ]; then
+    /etc/acme-hook-lighttpd.sh "$main_domain"
+fi

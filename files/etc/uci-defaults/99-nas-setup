@@ -1,0 +1,246 @@
+#!/bin/sh
+# OpenWrt Headless NAS First-Boot Setup Script
+# Automatically executed on first boot by OpenWrt /etc/init.d/boot
+
+set -e
+logger -t nas-setup "Starting OpenWrt Headless NAS first-boot configuration..."
+
+# Read configuration variables
+NAS_USER="$(cat /etc/nas_user 2>/dev/null || echo "nasuser")"
+NAS_PASS_HASH="$(cat /etc/nas_pass_hash 2>/dev/null || echo "")"
+ROOT_PASS_HASH="$(cat /etc/root_pass_hash 2>/dev/null || echo "")"
+DEVICE_HOSTNAME="$(uci get system.@system[0].hostname 2>/dev/null || echo "rpi4-nas")"
+
+# ------------------------------------------------------------------------------
+# 1. Non-Root User & Sudo Setup
+# ------------------------------------------------------------------------------
+if [ -n "$NAS_USER" ]; then
+    logger -t nas-setup "Setting up non-root user: $NAS_USER"
+
+    # Ensure sudo group exists
+    if ! grep -q "^sudo:" /etc/group; then
+        if command -v groupadd >/dev/null 2>&1; then
+            groupadd -g 27 sudo
+        else
+            echo "sudo:x:27:" >> /etc/group
+        fi
+    fi
+
+    # Ensure user group exists
+    if ! grep -q "^$NAS_USER:" /etc/group; then
+        if command -v groupadd >/dev/null 2>&1; then
+            groupadd -g 1000 "$NAS_USER" 2>/dev/null || groupadd "$NAS_USER"
+        else
+            echo "$NAS_USER:x:1000:" >> /etc/group
+        fi
+    fi
+
+    # Ensure standard shells exist in /etc/shells
+    grep -q "^/bin/ash$" /etc/shells 2>/dev/null || echo "/bin/ash" >> /etc/shells
+    grep -q "^/bin/sh$" /etc/shells 2>/dev/null || echo "/bin/sh" >> /etc/shells
+
+    # Create user if missing
+    if ! grep -q "^$NAS_USER:" /etc/passwd; then
+        if command -v useradd >/dev/null 2>&1; then
+            useradd -m -s /bin/ash -g "$NAS_USER" -G sudo "$NAS_USER"
+        else
+            echo "$NAS_USER:x:1000:1000:$NAS_USER:/home/$NAS_USER:/bin/ash" >> /etc/passwd
+        fi
+    fi
+
+    # Ensure user is in sudo and www-data groups
+    if command -v usermod >/dev/null 2>&1; then
+        usermod -a -G sudo "$NAS_USER" 2>/dev/null || true
+        usermod -a -G www-data "$NAS_USER" 2>/dev/null || true
+    fi
+    if ! grep -q "^sudo:.*$NAS_USER" /etc/group; then
+        sed -i "s/^sudo:x:27:.*$/&,$NAS_USER/; s/27:,/27:/" /etc/group
+    fi
+    if ! grep -q "^www-data:.*$NAS_USER" /etc/group; then
+        sed -i "s/^www-data:x:33:.*$/&,$NAS_USER/; s/33:,/33:/" /etc/group
+    fi
+
+    # Verify user was created successfully (fail fast)
+    id "$NAS_USER" >/dev/null 2>&1 || {
+        logger -t nas-setup "ERROR: Failed to create or find user '$NAS_USER'"
+        exit 1
+    }
+
+    # Apply password hash for non-root user
+    if [ -n "$NAS_PASS_HASH" ]; then
+        if grep -q "^$NAS_USER:" /etc/shadow; then
+            sed -i "s|^$NAS_USER:[^:]*:|$NAS_USER:$NAS_PASS_HASH:|" /etc/shadow
+        else
+            echo "$NAS_USER:$NAS_PASS_HASH:19000:0:99999:7:::" >> /etc/shadow
+        fi
+    fi
+
+    # Configure sudoers
+    mkdir -p /etc/sudoers.d
+    echo "$NAS_USER ALL=(ALL:ALL) ALL" > "/etc/sudoers.d/10-$NAS_USER"
+    chown -R 0:0 /etc/sudoers.d
+    chmod 0750 /etc/sudoers.d
+    chmod 0440 "/etc/sudoers.d/10-$NAS_USER"
+
+    # Setup SSH authorized keys for non-root user
+    mkdir -p "/home/$NAS_USER/.ssh"
+    if [ -f /etc/dropbear/authorized_keys ] && [ ! -s "/home/$NAS_USER/.ssh/authorized_keys" ]; then
+        cp /etc/dropbear/authorized_keys "/home/$NAS_USER/.ssh/authorized_keys"
+    fi
+    chmod 755 /home
+    chmod 700 "/home/$NAS_USER" "/home/$NAS_USER/.ssh"
+    [ -f "/home/$NAS_USER/.ssh/authorized_keys" ] && chmod 600 "/home/$NAS_USER/.ssh/authorized_keys"
+    chown -R "$NAS_USER:$NAS_USER" "/home/$NAS_USER"
+fi
+
+# Apply root password hash if configured
+if [ -n "$ROOT_PASS_HASH" ]; then
+    logger -t nas-setup "Setting root password from ROOT_PASSWORD hash..."
+    if grep -q "^root:" /etc/shadow; then
+        sed -i "s|^root:[^:]*:|root:$ROOT_PASS_HASH:|" /etc/shadow
+    else
+        echo "root:$ROOT_PASS_HASH:19000:0:99999:7:::" >> /etc/shadow
+    fi
+fi
+
+# Ensure shadow group exists and /etc/shadow is accessible to shadow group
+grep -q "^shadow:" /etc/group || groupadd -g 42 shadow 2>/dev/null || echo "shadow:x:42:" >> /etc/group
+chown root:shadow /etc/shadow 2>/dev/null || true
+chmod 640 /etc/shadow 2>/dev/null || true
+
+# Ensure www-data group and user exist for lighttpd
+grep -q "^www-data:" /etc/group || groupadd -g 33 www-data 2>/dev/null || echo "www-data:x:33:" >> /etc/group
+if ! grep -q "^www-data:" /etc/passwd; then
+    if command -v useradd >/dev/null 2>&1; then
+        useradd -u 33 -g www-data -G shadow -s /bin/false -d /var/www www-data 2>/dev/null || \
+        useradd -s /bin/false -d /var/www www-data
+    else
+        echo "www-data:x:33:33:www-data:/var/www:/bin/false" >> /etc/passwd
+    fi
+else
+    usermod -a -G shadow www-data 2>/dev/null || true
+fi
+
+# Ensure setuid root on unix_chkpwd for non-root PAM authentication
+chmod 4755 /usr/sbin/unix_chkpwd 2>/dev/null || true
+
+# ------------------------------------------------------------------------------
+# 2. SSH & SFTP Configuration (OpenSSH)
+# ------------------------------------------------------------------------------
+logger -t nas-setup "Configuring OpenSSH and SFTP..."
+mkdir -p /root/.ssh
+chmod 700 /root /root/.ssh
+if [ -f /etc/dropbear/authorized_keys ] && [ ! -s /root/.ssh/authorized_keys ]; then
+    cp /etc/dropbear/authorized_keys /root/.ssh/authorized_keys
+fi
+[ -f /root/.ssh/authorized_keys ] && chmod 600 /root/.ssh/authorized_keys
+
+# Generate host keys if not present
+if command -v ssh-keygen >/dev/null 2>&1; then
+    ssh-keygen -A 2>/dev/null || true
+fi
+
+# Switch from Dropbear to OpenSSH
+if [ -x /etc/init.d/dropbear ]; then
+    /etc/init.d/dropbear disable 2>/dev/null || true
+    /etc/init.d/dropbear stop 2>/dev/null || true
+fi
+if [ -x /etc/init.d/sshd ]; then
+    /etc/init.d/sshd enable 2>/dev/null || true
+    /etc/init.d/sshd restart 2>/dev/null || true
+fi
+
+# ------------------------------------------------------------------------------
+# 3. Lighttpd & WebDAV SSL Certificate Setup
+# ------------------------------------------------------------------------------
+logger -t nas-setup "Configuring Lighttpd WebDAV & SSL..."
+# Storage mountpoint defaults to root:root 0700 when unmounted to error out and prevent writes to RAM
+for m in /mnt/sda /mnt/sda1; do
+    if ! grep -q " $m " /proc/mounts; then
+        mkdir -p "$m"
+        chown root:root "$m"
+        chmod 0700 "$m"
+    fi
+done
+
+# Runtime directories owned by www-data
+mkdir -p /etc/lighttpd/ssl /var/lib/lighttpd /var/log/lighttpd /var/cache/lighttpd
+chown -R www-data:www-data /var/lib/lighttpd /var/log/lighttpd /var/cache/lighttpd
+chmod 775 /var/lib/lighttpd /var/log/lighttpd /var/cache/lighttpd
+
+# Generate self-signed certificate if no certificate exists
+if [ ! -f /etc/lighttpd/ssl/server.pem ]; then
+    if command -v openssl >/dev/null 2>&1; then
+        logger -t nas-setup "Generating initial self-signed SSL certificate for Lighttpd..."
+        TMP_DIR="$(mktemp -d)"
+        openssl req -x509 -nodes -not_before 20200101000000Z -days 7300 -newkey rsa:2048 \
+            -keyout "$TMP_DIR/key.pem" \
+            -out "$TMP_DIR/cert.pem" \
+            -subj "/C=US/ST=State/L=City/O=NAS/CN=$DEVICE_HOSTNAME" 2>/dev/null || true
+        cat "$TMP_DIR/key.pem" "$TMP_DIR/cert.pem" > /etc/lighttpd/ssl/selfsigned.pem
+        rm -rf "$TMP_DIR"
+        ln -sf /etc/lighttpd/ssl/selfsigned.pem /etc/lighttpd/ssl/server.pem
+        chmod 600 /etc/lighttpd/ssl/*.pem
+    fi
+fi
+
+if [ -x /etc/init.d/lighttpd ]; then
+    /etc/init.d/lighttpd enable 2>/dev/null || true
+    /etc/init.d/lighttpd restart 2>/dev/null || true
+fi
+
+# ------------------------------------------------------------------------------
+# 4. Tailscale Initialization
+# ------------------------------------------------------------------------------
+mkdir -p /etc/tailscale
+if [ -x /etc/init.d/tailscale ]; then
+    /etc/init.d/tailscale enable 2>/dev/null || true
+    /etc/init.d/tailscale start 2>/dev/null || true
+fi
+
+if [ -x /etc/init.d/tailscale-autojoin ]; then
+    /etc/init.d/tailscale-autojoin enable 2>/dev/null || true
+    /etc/init.d/tailscale-autojoin start 2>/dev/null || true
+fi
+
+# ------------------------------------------------------------------------------
+# 5. DDNS and ACME Services
+# ------------------------------------------------------------------------------
+if [ -x /etc/init.d/ddns ]; then
+    if [ "$(uci get ddns.nas_ddns.enabled 2>/dev/null)" = "1" ]; then
+        /etc/init.d/ddns enable 2>/dev/null || true
+        /etc/init.d/ddns start 2>/dev/null || true
+    fi
+fi
+
+if [ -x /etc/init.d/acme ]; then
+    if [ "$(uci get acme.nas_cert.enabled 2>/dev/null)" = "1" ]; then
+        /etc/init.d/acme enable 2>/dev/null || true
+        /etc/init.d/acme start 2>/dev/null || true
+        [ -x /etc/acme-hook-lighttpd.sh ] && /etc/acme-hook-lighttpd.sh >/dev/null 2>&1 || true
+    fi
+fi
+
+# ------------------------------------------------------------------------------
+# 6. Recovery & Automated Rollback Service
+# ------------------------------------------------------------------------------
+if [ -x /etc/init.d/nas-recovery ]; then
+    /etc/init.d/nas-recovery enable 2>/dev/null || true
+fi
+if [ -x /usr/bin/nas-recovery ]; then
+    /usr/bin/nas-recovery init-storage 2>/dev/null || true
+fi
+
+# ------------------------------------------------------------------------------
+# 7. WiFi Fallback Service
+# ------------------------------------------------------------------------------
+if [ -x /etc/init.d/nas-wifi-failover ]; then
+    /etc/init.d/nas-wifi-failover enable 2>/dev/null || true
+    /etc/init.d/nas-wifi-failover start 2>/dev/null || true
+fi
+
+# Cleanup sensitive temporary files (tailscale_auth_key is removed after auto-join succeeds)
+rm -f /etc/nas_pass_hash /etc/root_pass_hash
+
+logger -t nas-setup "OpenWrt Headless NAS first-boot setup finished successfully."
+exit 0

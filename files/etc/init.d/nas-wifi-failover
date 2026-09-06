@@ -1,0 +1,25 @@
+#!/bin/sh /etc/rc.common
+# ==============================================================================
+# OpenWrt Headless NAS – WiFi Auto-Connection & Failover Service
+# ==============================================================================
+
+START=40
+STOP=10
+
+USE_PROCD=1
+PROG=/usr/bin/nas-wifi-failover
+
+start_service() {
+    [ ! -f /etc/nas_wifi.conf ] && return 0
+
+    procd_open_instance
+    procd_set_param command "$PROG" monitor
+    procd_set_param respawn 3600 5 0
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+}
+
+stop_service() {
+    return 0
+}

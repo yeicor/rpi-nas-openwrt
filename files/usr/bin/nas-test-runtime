@@ -1,0 +1,180 @@
+#!/bin/sh
+# OpenWrt Headless NAS Runtime Verification Script
+
+# Stage 1: Setup writable RAM overlay if not in inner mode
+if [ "$1" != "--inner" ]; then
+    mount -t proc proc /proc 2>/dev/null || true
+    mount -t sysfs sys /sys 2>/dev/null || true
+    mount -t tmpfs tmpfs /tmp 2>/dev/null || true
+    mkdir -p /tmp/upper /tmp/work /tmp/merged
+    mount -t overlay overlay -o lowerdir=/,upperdir=/tmp/upper,workdir=/tmp/work /tmp/merged
+    mkdir -p /tmp/merged/proc /tmp/merged/sys /tmp/merged/tmp
+    mount --move /proc /tmp/merged/proc 2>/dev/null || true
+    mount --move /sys /tmp/merged/sys 2>/dev/null || true
+    mount -t tmpfs -o mode=1777 tmpfs /tmp/merged/tmp 2>/dev/null || true
+    exec chroot /tmp/merged /usr/bin/nas-test-runtime --inner
+fi
+
+# Stage 2: Inner mode with full writable filesystem
+mkdir -p /tmp /etc/config /mnt/sda1 2>/dev/null || true
+[ -e /var ] || mkdir -p /var 2>/dev/null || true
+[ -e /run ] || mkdir -p /run 2>/dev/null || true
+
+# Connect console for I/O
+if [ -e /dev/console ]; then
+    exec </dev/console >/dev/console 2>&1
+elif [ -e /dev/ttyAMA1 ]; then
+    exec </dev/ttyAMA1 >/dev/ttyAMA1 2>&1
+fi
+
+set -e
+
+msg() {
+    echo "$@"
+    echo "$@" >/dev/ttyAMA1 2>/dev/null || true
+    echo "$@" >/dev/console 2>/dev/null || true
+}
+
+msg ""
+msg "==========================================================="
+msg "=== OPENWRT HEADLESS NAS RUNTIME VERIFICATION ==="
+msg "==========================================================="
+msg ""
+
+FAILED=0
+assert() {
+    local desc="$1"
+    shift
+    if "$@"; then
+        msg "[PASS] $desc"
+    else
+        msg "[FAIL] $desc"
+        FAILED=1
+    fi
+}
+
+# 2. Run first boot configuration
+msg ">>> Step 1: Executing /etc/uci-defaults/99-nas-setup..."
+if [ -f /etc/uci-defaults/99-nas-setup ]; then
+    sh /etc/uci-defaults/99-nas-setup
+fi
+
+NAS_USER="$(cat /etc/nas_user 2>/dev/null || echo "nasuser")"
+
+# 3. Test Non-root user & sudo
+msg ">>> Step 2: Testing user accounts, shadow passwords, and sudoers..."
+assert "User '$NAS_USER' exists in /etc/passwd" id "$NAS_USER"
+assert "User '$NAS_USER' is in sudo group" grep -E "^sudo:.*$NAS_USER" /etc/group
+assert "User '$NAS_USER' is in www-data group" grep -E "^www-data:.*$NAS_USER" /etc/group
+assert "User 'www-data' exists in /etc/passwd" id "www-data"
+assert "Sudoers config file exists for '$NAS_USER'" test -f "/etc/sudoers.d/10-$NAS_USER"
+assert "User SHA-512 password hash recorded in /etc/shadow" grep -q "^$NAS_USER:\\\$6\\\$" /etc/shadow
+assert "Root password hash recorded in /etc/shadow" grep -q "^root:\\\$6\\\$" /etc/shadow
+assert "Home directory exists for '$NAS_USER'" test -d "/home/$NAS_USER"
+assert "SSH keys installed in user's ~/.ssh/authorized_keys" test -f "/home/$NAS_USER/.ssh/authorized_keys"
+assert "Root SSH authorized_keys exists" test -f "/root/.ssh/authorized_keys"
+
+# 4. Test Storage & USB Automount
+msg ">>> Step 3: Testing USB automount and non-root directory ownership..."
+TEST_BLK=""
+for dev in sda1 sda sdb1 sdb vda1 vda; do
+    if [ -b "/dev/$dev" ]; then
+        TEST_BLK="$dev"
+        break
+    fi
+done
+
+if [ -z "$TEST_BLK" ]; then
+    msg "Creating simulated block device for automount test..."
+    dd if=/dev/zero of=/tmp/test-disk.img bs=1M count=16 2>/dev/null
+    [ ! -b /dev/loop0 ] && mknod /dev/loop0 b 7 0
+    losetup /dev/loop0 /tmp/test-disk.img
+    mkfs.ext4 -F /dev/loop0 >/dev/null 2>&1 || true
+    mkdir -p /tmp/init_test_mnt
+    mount /dev/loop0 /tmp/init_test_mnt
+    chown "$NAS_USER:www-data" /tmp/init_test_mnt
+    chmod 775 /tmp/init_test_mnt
+    chmod g+s /tmp/init_test_mnt
+    umount /tmp/init_test_mnt
+    rmdir /tmp/init_test_mnt
+    TEST_BLK="loop0"
+fi
+
+UNMOUNT_OWNER="$(ls -ld /mnt/sda1 2>/dev/null | awk '{print $3}' || echo '')"
+if [ -n "$UNMOUNT_OWNER" ]; then
+    assert "Unmounted /mnt/sda1 is owned by root (detected: $UNMOUNT_OWNER)" [ "$UNMOUNT_OWNER" = "root" ] || [ "$UNMOUNT_OWNER" = "0" ]
+fi
+
+ACTION=add DEVNAME="$TEST_BLK" /etc/hotplug.d/block/10-mount || true
+
+assert "Mountpoint /mnt/sda1 exists" test -d /mnt/sda1
+STORAGE_OWNER="$(ls -ld /mnt/sda1 | awk '{print $3}')"
+STORAGE_GROUP="$(ls -ld /mnt/sda1 | awk '{print $4}')"
+assert "/mnt/sda1 owned by '$NAS_USER' (detected: $STORAGE_OWNER)" [ "$STORAGE_OWNER" = "$NAS_USER" ] || [ "$STORAGE_OWNER" = "1000" ]
+assert "/mnt/sda1 group is 'www-data' (detected: $STORAGE_GROUP)" [ "$STORAGE_GROUP" = "www-data" ] || [ "$STORAGE_GROUP" = "33" ]
+
+ACTION=remove DEVNAME="$TEST_BLK" /etc/hotplug.d/block/10-mount || true
+UNMOUNT_AFTER="$(ls -ld /mnt/sda1 | awk '{print $3}')"
+assert "Unmounted /mnt/sda1 resets to root ownership (detected: $UNMOUNT_AFTER)" [ "$UNMOUNT_AFTER" = "root" ] || [ "$UNMOUNT_AFTER" = "0" ]
+
+# Re-mount for subsequent runtime tests
+ACTION=add DEVNAME="$TEST_BLK" /etc/hotplug.d/block/10-mount || true
+
+# 5. Test OpenSSH Server & SFTP
+msg ">>> Step 4: Testing OpenSSH Server and SFTP subsystem..."
+assert "OpenSSH server binary /usr/sbin/sshd exists" test -x /usr/sbin/sshd
+assert "SFTP server binary exists" [ -x /usr/lib/sftp-server ] || [ -x /usr/libexec/sftp-server ]
+assert "OpenSSH config syntax is valid" /usr/sbin/sshd -t
+# Start sshd daemon
+/usr/sbin/sshd
+sleep 1
+assert "OpenSSH server process is running" pgrep -f "/usr/sbin/sshd"
+
+# 6. Test Lighttpd WebDAV & PAM
+msg ">>> Step 5: Testing Lighttpd WebDAV and PAM authentication stack..."
+assert "Lighttpd binary /usr/sbin/lighttpd exists" test -x /usr/sbin/lighttpd
+assert "PAM service file /etc/pam.d/lighttpd exists" test -f /etc/pam.d/lighttpd
+assert "SSL certificate exists (/etc/lighttpd/ssl/server.pem)" test -f /etc/lighttpd/ssl/server.pem
+assert "Lighttpd configuration syntax is valid" /usr/sbin/lighttpd -t -f /etc/lighttpd/lighttpd.conf
+# Start lighttpd daemon
+/usr/sbin/lighttpd -f /etc/lighttpd/lighttpd.conf
+sleep 1
+assert "Lighttpd daemon is running" pgrep -f "/usr/sbin/lighttpd"
+
+# 7. Test Tailscale Daemon
+msg ">>> Step 6: Testing Tailscale VPN service..."
+assert "tailscale CLI binary exists" test -x /usr/sbin/tailscale
+assert "tailscaled daemon binary exists" test -x /usr/sbin/tailscaled
+assert "Tailscale autojoin script exists and is executable" test -x /usr/bin/tailscale-autojoin
+assert "Tailscale autojoin service exists" test -f /etc/init.d/tailscale-autojoin
+# Start tailscaled in test background mode
+/usr/sbin/tailscaled --state=/tmp/tailscaled.state >/dev/null 2>&1 &
+sleep 1
+assert "Tailscaled process is running" pgrep -f "tailscaled"
+
+# 8. Test Network & Firewall Configuration
+msg ">>> Step 7: Testing Network and Firewall rules..."
+assert "Network config has eth0 LAN in DHCP mode" grep -q "option proto 'dhcp'" /etc/config/network
+assert "DHCP server is disabled on LAN interface" grep -q "option ignore '1'" /etc/config/dhcp
+assert "Firewall has dedicated Tailscale zone" grep -q "option name 'tailscale'" /etc/config/firewall
+assert "Firewall allows SSH (port 22)" grep -q "22" /etc/config/firewall
+assert "Firewall allows HTTP/HTTPS (port 80 443)" grep -q "80 443" /etc/config/firewall
+assert "Firewall allows WebDAV (ports 8080 8443)" grep -q "8080 8443" /etc/config/firewall
+
+# 9. Test ACME & DDNS Configuration
+msg ">>> Step 8: Testing ACME and Dynamic DNS templates..."
+assert "ACME config template exists" test -f /etc/config/acme
+assert "ACME reload hook script exists" test -x /etc/acme-hook-lighttpd.sh
+assert "ACME config has update_scripts hook configured" grep -q "/etc/acme-hook-lighttpd.sh" /etc/config/acme
+assert "DDNS config template exists" test -f /etc/config/ddns
+
+msg ""
+msg "==========================================================="
+if [ "$FAILED" -eq 0 ]; then
+    msg "=== ALL NAS RUNTIME TESTS PASSED SUCCESSFULLY! ==="
+else
+    msg "=== ERROR: ONE OR MORE NAS RUNTIME TESTS FAILED! ==="
+fi
+msg "==========================================================="
+msg ""
+

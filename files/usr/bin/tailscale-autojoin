@@ -1,0 +1,62 @@
+#!/bin/sh
+# Tailscale Zero-Touch First-Boot Auto-Join Script
+# Retries connection until network and tailscaled are ready, then cleans up auth key
+
+set -e
+
+KEY_FILE="/etc/tailscale_auth_key"
+
+if [ ! -f "$KEY_FILE" ]; then
+    exit 0
+fi
+
+TS_KEY="$(cat "$KEY_FILE" | tr -d '\r\n ')"
+if [ -z "$TS_KEY" ]; then
+    rm -f "$KEY_FILE"
+    exit 0
+fi
+
+DEVICE_HOSTNAME="$(uci get system.@system[0].hostname 2>/dev/null || echo "rpi4-nas")"
+
+logger -t tailscale-autojoin "Waiting for tailscaled daemon socket..."
+# Wait up to 60s for tailscaled socket to appear
+for i in $(seq 1 30); do
+    if [ -S /var/run/tailscale/tailscaled.sock ] || [ -S /run/tailscale/tailscaled.sock ]; then
+        break
+    fi
+    sleep 2
+done
+
+logger -t tailscale-autojoin "Starting Tailscale auto-join for host '$DEVICE_HOSTNAME'..."
+
+# Retry tailscale up until successful authentication
+MAX_ATTEMPTS=60
+for attempt in $(seq 1 $MAX_ATTEMPTS); do
+    # Check if already authenticated
+    if tailscale status >/dev/null 2>&1; then
+        logger -t tailscale-autojoin "Tailscale is already authenticated and active."
+        rm -f "$KEY_FILE"
+        /etc/init.d/tailscale-autojoin disable 2>/dev/null || true
+        exit 0
+    fi
+
+    if tailscale up \
+        --authkey="$TS_KEY" \
+        --advertise-exit-node \
+        --ssh \
+        --netfilter-mode=off \
+        --hostname="$DEVICE_HOSTNAME" \
+        --reset \
+        --timeout=30s; then
+        logger -t tailscale-autojoin "Successfully authenticated and joined Tailscale!"
+        rm -f "$KEY_FILE"
+        /etc/init.d/tailscale-autojoin disable 2>/dev/null || true
+        exit 0
+    else
+        logger -t tailscale-autojoin "Tailscale up attempt $attempt/$MAX_ATTEMPTS failed (waiting for WAN/DNS), retrying in 5s..."
+        sleep 5
+    fi
+done
+
+logger -t tailscale-autojoin "WARNING: Tailscale auto-join reached maximum attempts ($MAX_ATTEMPTS). Preserving auth key for retry."
+exit 1

@@ -1,0 +1,122 @@
+#!/bin/sh
+# Hotplug USB automount script for OpenWrt Headless NAS
+# Mounts external USB storage to /mnt/sda1 and ensures proper non-root ownership
+
+set -e
+
+ACTION="${ACTION:-}"
+DEVNAME="${DEVNAME:-}"
+
+[ -z "$DEVNAME" ] && exit 0
+
+# Match disk partitions like sda1, sdb1, nvme0n1p1, etc.
+# Exclude mmcblk* which is the internal Raspberry Pi microSD/eMMC card holding OpenWrt rootfs
+case "$DEVNAME" in
+    sd[a-z]|sd[a-z][0-9]*|vd[a-z]|vd[a-z][0-9]*|nvme[0-9]*n[0-9]*|nvme[0-9]*n[0-9]*p[0-9]*|loop[0-9]*)
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+
+DEVPATH="/dev/$DEVNAME"
+[ -b "$DEVPATH" ] || exit 0
+
+# Verify block device has non-zero capacity (avoids attempting mount on empty loop1..loop7 devices)
+DEV_SIZE="$(cat "/sys/class/block/$DEVNAME/size" 2>/dev/null || echo 0)"
+[ "$DEV_SIZE" -gt 0 ] || exit 0
+
+TARGET="/mnt/sda1"
+MOUNT_POINT="$TARGET"
+
+# Read configured NAS non-root user and www-data group
+NAS_USER="$(cat /etc/nas_user 2>/dev/null || echo "nasuser")"
+NAS_UID="$(id -u "$NAS_USER" 2>/dev/null || echo 1000)"
+WWW_GID="$(id -g www-data 2>/dev/null || echo 33)"
+
+case "$ACTION" in
+    add)
+        logger -t hotplug-usb "USB partition $DEVPATH plugged in"
+
+        # Check if already mounted
+        if grep -q "^$DEVPATH " /proc/mounts; then
+            logger -t hotplug-usb "$DEVPATH is already mounted"
+            exit 0
+        fi
+
+        # Detect filesystem via /sbin/block info or blkid
+        FSTYPE=""
+        if [ -x /sbin/block ]; then
+            FSTYPE="$(/sbin/block info "$DEVPATH" 2>/dev/null | grep -o 'TYPE="[^"]*"' | cut -d'"' -f2)"
+        fi
+        if [ -z "$FSTYPE" ] && command -v blkid >/dev/null 2>&1; then
+            FSTYPE="$(blkid -o value -s TYPE "$DEVPATH" 2>/dev/null || true)"
+        fi
+
+        # Do not attempt to mount if no valid filesystem is detected
+        if [ -z "$FSTYPE" ]; then
+            logger -t hotplug-usb "No valid filesystem detected on $DEVPATH, skipping mount"
+            exit 0
+        fi
+
+        # If /mnt/sda1 is already mounted to another device, mount to /mnt/$DEVNAME
+        if grep -q " $TARGET " /proc/mounts; then
+            MOUNT_POINT="/mnt/$DEVNAME"
+        fi
+
+        mkdir -p "$MOUNT_POINT"
+
+        MOUNT_OPTS="rw,noatime"
+
+        case "$FSTYPE" in
+            vfat|fat)
+                MOUNT_OPTS="$MOUNT_OPTS,uid=$NAS_UID,gid=$WWW_GID,fmask=0002,dmask=0002,utf8=1"
+                ;;
+            exfat)
+                MOUNT_OPTS="$MOUNT_OPTS,uid=$NAS_UID,gid=$WWW_GID,fmask=0002,dmask=0002"
+                ;;
+            ntfs|ntfs3)
+                MOUNT_OPTS="$MOUNT_OPTS,uid=$NAS_UID,gid=$WWW_GID,fmask=0002,dmask=0002,iocharset=utf8"
+                ;;
+            ext4|ext3|ext2|btrfs|f2fs)
+                # POSIX filesystems assume existing permissions on disk
+                ;;
+            *)
+                # Default generic mount
+                ;;
+        esac
+
+        logger -t hotplug-usb "Mounting $DEVPATH ($FSTYPE) to $MOUNT_POINT with opts: $MOUNT_OPTS"
+        if mount -t "$FSTYPE" -o "$MOUNT_OPTS" "$DEVPATH" "$MOUNT_POINT" 2>/dev/null || mount -o "$MOUNT_OPTS" "$DEVPATH" "$MOUNT_POINT"; then
+            logger -t hotplug-usb "Mounted $DEVPATH successfully at $MOUNT_POINT"
+
+            # If mounted to secondary name, ensure symlink if primary target is free
+            if [ "$MOUNT_POINT" != "$TARGET" ] && [ ! -e "$TARGET" ]; then
+                ln -s "$MOUNT_POINT" "$TARGET" 2>/dev/null || true
+            fi
+        else
+            logger -t hotplug-usb "Failed to mount $DEVPATH to $MOUNT_POINT"
+        fi
+        ;;
+
+    remove)
+        logger -t hotplug-usb "USB partition $DEVPATH unplugged"
+        CURRENT_MOUNT="$(grep "^$DEVPATH " /proc/mounts | awk '{print $2}')"
+        if [ -n "$CURRENT_MOUNT" ]; then
+            umount -l "$CURRENT_MOUNT" || true
+            logger -t hotplug-usb "Unmounted $CURRENT_MOUNT"
+            case "$CURRENT_MOUNT" in
+                /mnt/sda|/mnt/sda1)
+                    # Reset target mountpoint to root:root 0700 so no writes can occur to RAM when unmounted
+                    chown root:root "$CURRENT_MOUNT" 2>/dev/null || true
+                    chmod 0700 "$CURRENT_MOUNT" 2>/dev/null || true
+                    ;;
+                *)
+                    [ -d "$CURRENT_MOUNT" ] && rmdir "$CURRENT_MOUNT" 2>/dev/null || true
+                    ;;
+            esac
+        fi
+        ;;
+esac
+
+exit 0
