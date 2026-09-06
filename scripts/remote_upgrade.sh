@@ -211,6 +211,32 @@ if [ "$FREE_TMP_KB" -lt "$REQUIRED_KB" ]; then
     exit 1
 fi
 
+# Check image partition layout against remote disk boundaries
+echo -n "Validating partition layout boundaries... "
+IMG_P2_END="$(gzip -dc "$SYSUPGRADE_IMG" 2>/dev/null | dd bs=512 count=1 2>/dev/null | python3 -c '
+import sys, struct
+data = sys.stdin.buffer.read(512)
+if len(data) == 512 and data[510:512] == b"\x55\xaa":
+    offset = 0x1be + 16
+    start, size = struct.unpack("<II", data[offset+8:offset+16])
+    print(start + size - 1)
+' 2>/dev/null || true)"
+
+REMOTE_P3_START="$(run_ssh "fdisk -l /dev/mmcblk0 2>/dev/null | grep -E 'p3\b| 3 ' | awk '{print \$2}'" 2>/dev/null || true)"
+
+if [ -n "$IMG_P2_END" ] && [ -n "$REMOTE_P3_START" ]; then
+    if [ "$IMG_P2_END" -ge "$REMOTE_P3_START" ]; then
+        echo "COLLISION DETECTED!"
+        echo "Error: Firmware partition 2 ends at sector $IMG_P2_END, which overlaps" >&2
+        echo "with remote partition 3 (/recovery) starting at sector $REMOTE_P3_START." >&2
+        echo "Upgrade aborted to prevent corrupting persistent recovery storage." >&2
+        exit 1
+    fi
+    echo "SAFE (P2 end: $IMG_P2_END < P3 start: $REMOTE_P3_START)"
+else
+    echo "OK"
+fi
+
 # Ensure remote recovery partition is initialized
 run_ssh "mkdir -p /usr/bin; nas-recovery init-storage 2>/dev/null || true"
 

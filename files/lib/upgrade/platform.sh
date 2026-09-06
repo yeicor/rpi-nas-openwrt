@@ -25,6 +25,11 @@ platform_check_image() {
 	rm -f /tmp/image.bs /tmp/partmap.bootdisk /tmp/partmap.image
 
 	if [ -n "$diff" ]; then
+		if export_partdevice partdev 3; then
+			echo "ERROR: Sysupgrade image partition layout does not match target disk, and persistent partition 3 (/recovery) exists." >&2
+			echo "Full disk overwrite is blocked to protect persistent recovery data. Image must match partition 1 & 2 boundaries." >&2
+			return 1
+		fi
 		echo "Partition layout has changed. Full image will be written."
 		ask_bool 0 "Abort" && exit 1
 		return 0
@@ -58,6 +63,10 @@ platform_do_upgrade() {
 	fi
 
 	if [ -n "$diff" ]; then
+		if export_partdevice partdev 3; then
+			echo "ERROR: Refusing full disk write because persistent partition 3 (/recovery) exists." >&2
+			return 1
+		fi
 		get_image "$@" | dd of="/dev/$diskdev" bs=2M conv=fsync
 
 		partx -d - "/dev/$diskdev"

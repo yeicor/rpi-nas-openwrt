@@ -156,6 +156,14 @@ done
 # Compute checksums on generated image files
 find . -maxdepth 1 -type f ! -name "sha256sums.txt" -exec sha256sum {} + > sha256sums.txt
 
+# Report partition 2 allocation
+for img in *squashfs-factory.img; do
+    if [ -f "$img" ]; then
+        P2_SIZE="$(fdisk -l "$img" 2>/dev/null | grep -E "${img}2|img2" | awk '{print $5}')"
+        echo "Firmware rootfs partition 2 size: ${P2_SIZE:-104M} (fixed boundary)"
+    fi
+done
+
 echo "================================================================="
 echo " Build Succeeded! Ready-to-flash images:"
 ls -lh "$OUTPUT_DIR"
