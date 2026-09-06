@@ -84,8 +84,10 @@ DEFAULT_NAS_PACKAGES="
     kmod-fs-ext4
     kmod-fs-exfat
     kmod-fs-ntfs3
+    kmod-fs-btrfs
     kmod-nls-utf8
     e2fsprogs
+    btrfs-progs
     fdisk
     usbutils
     mount-utils

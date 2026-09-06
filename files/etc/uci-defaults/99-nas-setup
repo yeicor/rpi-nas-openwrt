@@ -183,6 +183,14 @@ if [ -x /etc/init.d/sshd ]; then
 fi
 
 # ------------------------------------------------------------------------------
+# 2b. Storage Automount Service
+# ------------------------------------------------------------------------------
+if [ -x /etc/init.d/nas-mount ]; then
+    /etc/init.d/nas-mount enable 2>/dev/null || true
+    /etc/init.d/nas-mount start 2>/dev/null || true
+fi
+
+# ------------------------------------------------------------------------------
 # 3. Lighttpd & WebDAV SSL Certificate Setup
 # ------------------------------------------------------------------------------
 logger -t nas-setup "Configuring Lighttpd WebDAV & SSL..."

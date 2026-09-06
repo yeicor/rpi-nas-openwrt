@@ -90,9 +90,28 @@ case "$ACTION" in
         if mount -t "$FSTYPE" -o "$MOUNT_OPTS" "$DEVPATH" "$MOUNT_POINT" 2>/dev/null || mount -o "$MOUNT_OPTS" "$DEVPATH" "$MOUNT_POINT"; then
             logger -t hotplug-usb "Mounted $DEVPATH successfully at $MOUNT_POINT"
 
+            case "$FSTYPE" in
+                ext4|ext3|ext2|btrfs|f2fs)
+                    # For POSIX filesystems, ensure the mount root directory is group-owned by www-data
+                    # and group-writable so WebDAV and NAS_USER (member of www-data) have write access.
+                    MNT_OWNER="$(ls -ld "$MOUNT_POINT" 2>/dev/null | awk '{print $3}')"
+                    if [ "$MNT_OWNER" = "root" ] || [ "$MNT_OWNER" = "0" ]; then
+                        chown "$NAS_UID:$WWW_GID" "$MOUNT_POINT" 2>/dev/null || true
+                    else
+                        chgrp "$WWW_GID" "$MOUNT_POINT" 2>/dev/null || true
+                    fi
+                    chmod 775 "$MOUNT_POINT" 2>/dev/null || true
+                    ;;
+            esac
+
             # If mounted to secondary name, ensure symlink if primary target is free
             if [ "$MOUNT_POINT" != "$TARGET" ] && [ ! -e "$TARGET" ]; then
                 ln -s "$MOUNT_POINT" "$TARGET" 2>/dev/null || true
+            fi
+
+            # Refresh lighttpd so web server recognizes the newly mounted filesystem
+            if [ -x /etc/init.d/lighttpd ] && /etc/init.d/lighttpd running 2>/dev/null; then
+                /etc/init.d/lighttpd reload 2>/dev/null || true
             fi
         else
             logger -t hotplug-usb "Failed to mount $DEVPATH to $MOUNT_POINT"

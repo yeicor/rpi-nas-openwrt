@@ -1,0 +1,29 @@
+#!/bin/sh /etc/rc.common
+# Boot-time automounter for external NAS storage drives (/mnt/sda1)
+
+START=40
+STOP=90
+
+boot() {
+	start
+}
+
+start() {
+	# Ensure mount directory exists
+	mkdir -p /mnt/sda1 2>/dev/null || true
+
+	# Scan for block devices and trigger hotplug mounting
+	for dev in /dev/sd[a-z][0-9]* /dev/sd[a-z] /dev/vd[a-z][0-9]* /dev/vd[a-z] /dev/nvme[0-9]*n[0-9]*p[0-9]*; do
+		[ -b "$dev" ] || continue
+		DEVNAME="${dev#/dev/}"
+		ACTION=add DEVNAME="$DEVNAME" /etc/hotplug.d/block/10-mount || true
+	done
+}
+
+stop() {
+	for m in /mnt/sda1 /mnt/sda /mnt/sd*; do
+		if grep -q " $m " /proc/mounts; then
+			umount -l "$m" 2>/dev/null || true
+		fi
+	done
+}
