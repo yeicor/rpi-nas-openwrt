@@ -11,6 +11,7 @@ config zone
 	option input 'ACCEPT'
 	option output 'ACCEPT'
 	option forward 'ACCEPT'
+	option masq '1'
 
 # Tailscale VPN Zone
 config zone
@@ -45,4 +46,10 @@ config rule
 	option proto 'tcp'
 	option dest_port '8080 8443'
 	option target 'ACCEPT'
+
+# Allow Tailscale clients to forward traffic to LAN (eth0/wifi)
+config forwarding
+	option src 'tailscale'
+	option dest 'lan'
+
 

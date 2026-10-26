@@ -37,6 +37,20 @@ if [ -f /rom/etc/nas_wifi.conf ]; then
     chmod 600 /etc/nas_wifi.conf
 fi
 
+# Ensure Tailscale to LAN/WiFi forwarding and masquerading are configured
+if [ -f /etc/config/firewall ]; then
+    LAN_ZONE_IDX="$(uci show firewall 2>/dev/null | grep "\.name='lan'" | cut -d'.' -f2 | cut -d'=' -f1 || echo '@zone[0]')"
+    [ -z "$LAN_ZONE_IDX" ] && LAN_ZONE_IDX="@zone[0]"
+    uci set "firewall.${LAN_ZONE_IDX}.masq=1"
+    if ! uci show firewall 2>/dev/null | grep -q "\.src='tailscale'"; then
+        logger -t nas-setup "Adding Tailscale to LAN/WiFi forwarding rule in firewall"
+        FW_FWD="$(uci add firewall forwarding)"
+        uci set "firewall.${FW_FWD}.src=tailscale"
+        uci set "firewall.${FW_FWD}.dest=lan"
+    fi
+    uci commit firewall
+fi
+
 # Read configuration variables
 NAS_USER="$(cat /etc/nas_user 2>/dev/null || echo "nasuser")"
 NAS_PASS_HASH="$(cat /etc/nas_pass_hash 2>/dev/null || echo "")"

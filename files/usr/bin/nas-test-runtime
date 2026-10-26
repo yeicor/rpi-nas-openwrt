@@ -160,6 +160,8 @@ assert "Firewall has dedicated Tailscale zone" grep -q "option name 'tailscale'"
 assert "Firewall allows SSH (port 22)" grep -q "22" /etc/config/firewall
 assert "Firewall allows HTTP/HTTPS (port 80 443)" grep -q "80 443" /etc/config/firewall
 assert "Firewall allows WebDAV (ports 8080 8443)" grep -q "8080 8443" /etc/config/firewall
+assert "Firewall has Tailscale to LAN/WiFi forwarding" grep -q "src 'tailscale'" /etc/config/firewall
+assert "Firewall LAN zone has masquerading enabled" grep -q "option masq '1'" /etc/config/firewall
 
 # 9. Test ACME & DDNS Configuration
 msg ">>> Step 8: Testing ACME and Dynamic DNS templates..."
