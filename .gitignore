@@ -19,6 +19,7 @@ cache/
 *.tar.zst
 
 # Test & diagnostic artifacts
+backups/
 tests/tmp/
 tests/test-usb.img
 

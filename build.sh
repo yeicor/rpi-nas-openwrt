@@ -29,9 +29,12 @@ ERRORS=()
 [ -z "${OPENWRT_PROFILE:-}" ] && ERRORS+=("OPENWRT_PROFILE is required (e.g. rpi-4).")
 [ -z "${DEVICE_HOSTNAME:-}" ] && ERRORS+=("DEVICE_HOSTNAME is required (e.g. rpi4nas).")
 [ -z "${NAS_USER:-}" ] && ERRORS+=("NAS_USER is required.")
-[ -z "${NAS_PASSWORD:-}" ] && ERRORS+=("NAS_PASSWORD is required.")
-ROOT_PASSWORD="${ROOT_PASSWORD:-$NAS_PASSWORD}"
-[ -z "${ROOT_PASSWORD:-}" ] && ERRORS+=("ROOT_PASSWORD is required.")
+if [ -z "${NAS_PASSWORD:-}" ] && [ -z "${NAS_PASS_HASH:-}" ]; then
+    ERRORS+=("NAS_PASSWORD or NAS_PASS_HASH is required.")
+fi
+if [ -z "${ROOT_PASSWORD:-}" ] && [ -z "${ROOT_PASS_HASH:-}" ] && [ -z "${NAS_PASSWORD:-}" ]; then
+    ERRORS+=("ROOT_PASSWORD or ROOT_PASS_HASH is required.")
+fi
 [ -z "${SSH_PUBLIC_KEY:-}" ] && ERRORS+=("SSH_PUBLIC_KEY is required.")
 
 # Validate SSH Public Key
@@ -109,14 +112,29 @@ mkdir -p "$OVERLAY_DIR/etc" "$OVERLAY_DIR/etc/tailscale" "$OVERLAY_DIR/mnt/sda1"
 rm -rf "$OVERLAY_DIR/var"
 echo "$NAS_USER" > "$OVERLAY_DIR/etc/nas_user"
 
-if command -v openssl >/dev/null 2>&1; then
+if [ -n "${NAS_PASS_HASH:-}" ]; then
+    PASS_HASH="$NAS_PASS_HASH"
+    echo "$PASS_HASH" > "$OVERLAY_DIR/etc/nas_pass_hash"
+elif command -v openssl >/dev/null 2>&1; then
     PASS_HASH="$(openssl passwd -6 "$NAS_PASSWORD")"
     echo "$PASS_HASH" > "$OVERLAY_DIR/etc/nas_pass_hash"
-    ROOT_PASS_HASH="$(openssl passwd -6 "$ROOT_PASSWORD")"
-    echo "$ROOT_PASS_HASH" > "$OVERLAY_DIR/etc/root_pass_hash"
 else
     echo "Error: openssl command not found on host to generate password hash." >&2
     exit 1
+fi
+
+if [ -n "${ROOT_PASS_HASH:-}" ]; then
+    ROOT_PASS_HASH_VAL="$ROOT_PASS_HASH"
+    echo "$ROOT_PASS_HASH_VAL" > "$OVERLAY_DIR/etc/root_pass_hash"
+elif [ -n "${ROOT_PASSWORD:-}" ] || [ -n "${NAS_PASSWORD:-}" ]; then
+    if command -v openssl >/dev/null 2>&1; then
+        ROOT_PASSWORD="${ROOT_PASSWORD:-$NAS_PASSWORD}"
+        ROOT_PASS_HASH_VAL="$(openssl passwd -6 "$ROOT_PASSWORD")"
+        echo "$ROOT_PASS_HASH_VAL" > "$OVERLAY_DIR/etc/root_pass_hash"
+    else
+        echo "Error: openssl command not found on host to generate password hash." >&2
+        exit 1
+    fi
 fi
 
 # (b) SSH Public Keys
